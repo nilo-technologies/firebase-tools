@@ -15,6 +15,8 @@ import * as experiments from "../../experiments";
 import { findEndpoint } from "./backend";
 import { deploy as extDeploy } from "../extensions";
 import { getProjectNumber } from "../../getProjectNumber";
+import { logger } from "../../logger";
+import { Timer } from "./release/timer";
 
 setGracefulCleanup();
 
@@ -175,24 +177,37 @@ export async function deploy(
   options: Options,
   payload: args.Payload,
 ): Promise<void> {
+  const deployTimer = new Timer();
+  logger.info("[timing] functions: deploy: starting source upload");
+
   // Deploy extensions
   if (payload.extensions && context.extensions) {
+    const extTimer = new Timer();
     await extDeploy(context.extensions, options, payload.extensions);
+    logger.info(`[timing] functions: deploy: deployed extensions (${extTimer.stop()}ms)`);
   }
 
   // Deploy functions
   if (payload.functions && context.config) {
+    const iamCheckTimer = new Timer();
     await checkHttpIam(context, options, payload);
+    logger.info(`[timing] functions: deploy: checked HTTP IAM (${iamCheckTimer.stop()}ms)`);
+
+    const uploadTimer = new Timer();
     const uploads: Promise<void>[] = [];
     for (const [codebase, { wantBackend, haveBackend }] of Object.entries(payload.functions)) {
       if (shouldUploadBeSkipped(context, wantBackend, haveBackend)) {
+        logger.info(`[timing] functions: deploy: skipping upload for codebase ${codebase} (unchanged)`);
         continue;
       }
       const projectNumber = options.projectNumber || (await getProjectNumber(context.projectId));
       uploads.push(uploadCodebase(context, projectNumber, codebase, wantBackend));
     }
     await Promise.all(uploads);
+    logger.info(`[timing] functions: deploy: uploaded source (${uploadTimer.stop()}ms)`);
   }
+
+  logger.info(`[timing] functions: deploy: total deploy time (${deployTimer.stop()}ms)`);
 }
 
 /**

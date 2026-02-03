@@ -8,6 +8,7 @@ import { Context } from "./args";
 import { assertExhaustive, flattenArray } from "../../functional";
 import { logger } from "../../logger";
 import * as experiments from "../../experiments";
+import { Timer } from "./release/timer";
 
 /** Retry settings for a ScheduleSpec. */
 export interface ScheduleRetryConfig {
@@ -545,6 +546,9 @@ export function existingBackend(context: Context, forceRefresh?: boolean): Promi
 }
 
 async function loadExistingBackend(ctx: Context): Promise<Backend> {
+  const loadTimer = new Timer();
+  logger.info("[timing] functions: backend: loading existing backend");
+
   // Note: is it worth deducing the APIs that must have been enabled for this backend to work?
   // it could reduce redundant API calls for enabling the APIs.
   const existingBackend = {
@@ -555,6 +559,8 @@ async function loadExistingBackend(ctx: Context): Promise<Backend> {
     gcfV2: [] as string[],
     run: [] as string[],
   };
+
+  const gcfV1Timer = new Timer();
   const gcfV1Results = await gcf.listAllFunctions(ctx.projectId);
   for (const apiFunction of gcfV1Results.functions) {
     const endpoint = gcf.endpointFromFunction(apiFunction);
@@ -562,8 +568,12 @@ async function loadExistingBackend(ctx: Context): Promise<Backend> {
     existingBackend.endpoints[endpoint.region][endpoint.id] = endpoint;
   }
   unreachableRegions.gcfV1 = gcfV1Results.unreachable;
+  logger.info(
+    `[timing] functions: backend: listed ${gcfV1Results.functions.length} GCFv1 functions (${gcfV1Timer.stop()}ms)`,
+  );
 
   if (experiments.isEnabled("functionsrunapionly")) {
+    const runTimer = new Timer();
     try {
       const runServices = await run.listServices(ctx.projectId);
       for (const service of runServices) {
@@ -572,11 +582,13 @@ async function loadExistingBackend(ctx: Context): Promise<Backend> {
           existingBackend.endpoints[endpoint.region] || {};
         existingBackend.endpoints[endpoint.region][endpoint.id] = endpoint;
       }
+      logger.info(`[timing] functions: backend: listed ${runServices.length} Cloud Run services (${runTimer.stop()}ms)`);
     } catch (err: any) {
       logger.debug(err.message);
       unreachableRegions.run = ["unknown"];
     }
   } else {
+    const gcfV2Timer = new Timer();
     const gcfV2Results = await gcfV2.listAllFunctions(ctx.projectId);
     for (const apiFunction of gcfV2Results.functions) {
       const endpoint = gcfV2.endpointFromFunction(apiFunction);
@@ -584,7 +596,15 @@ async function loadExistingBackend(ctx: Context): Promise<Backend> {
       existingBackend.endpoints[endpoint.region][endpoint.id] = endpoint;
     }
     unreachableRegions.gcfV2 = gcfV2Results.unreachable;
+    logger.info(
+      `[timing] functions: backend: listed ${gcfV2Results.functions.length} GCFv2 functions (${gcfV2Timer.stop()}ms)`,
+    );
   }
+
+  const totalEndpoints = allEndpoints(existingBackend).length;
+  logger.info(
+    `[timing] functions: backend: loaded ${totalEndpoints} total existing endpoints (${loadTimer.stop()}ms)`,
+  );
 
   ctx.existingBackend = existingBackend;
   ctx.unreachableRegions = unreachableRegions;

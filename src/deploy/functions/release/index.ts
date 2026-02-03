@@ -17,6 +17,7 @@ import { FirebaseError } from "../../../error";
 import { getProjectNumber } from "../../../getProjectNumber";
 import { release as extRelease } from "../../extensions";
 import * as artifacts from "../../../functions/artifacts";
+import { Timer } from "./timer";
 
 /** Releases new versions of functions and extensions to prod. */
 export async function release(
@@ -24,9 +25,14 @@ export async function release(
   options: Options,
   payload: args.Payload,
 ): Promise<void> {
+  const releaseTimer = new Timer();
+  logger.info("[timing] functions: release: starting release");
+
   // Release extensions if any
   if (context.extensions && payload.extensions) {
+    const extTimer = new Timer();
     await extRelease(context.extensions, options, payload.extensions);
+    logger.info(`[timing] functions: release: released extensions (${extTimer.stop()}ms)`);
   }
 
   if (!context.config) {
@@ -39,6 +45,7 @@ export async function release(
     return;
   }
 
+  const planningTimer = new Timer();
   let plan: planner.DeploymentPlan = {};
   for (const [codebase, { wantBackend, haveBackend }] of Object.entries(payload.functions)) {
     plan = {
@@ -51,6 +58,7 @@ export async function release(
       }),
     };
   }
+  logger.info(`[timing] functions: release: created deployment plan (${planningTimer.stop()}ms)`);
 
   const fnsToDelete = Object.values(plan)
     .map((regionalChanges) => regionalChanges.endpointsToDelete)
@@ -93,7 +101,9 @@ export async function release(
     projectNumber: projectNumber,
   });
 
+  const applyPlanTimer = new Timer();
   const summary = await fab.applyPlan(plan);
+  logger.info(`[timing] functions: release: applied deployment plan (${applyPlanTimer.stop()}ms)`);
 
   await reporter.logAndTrackDeployStats(summary, context);
   reporter.printErrors(summary);
@@ -120,6 +130,8 @@ export async function release(
     }
     throw new FirebaseError("There was an error deploying functions", { ...opts, exit: 2 });
   }
+
+  logger.info(`[timing] functions: release: total release time (${releaseTimer.stop()}ms)`);
 }
 
 /**

@@ -53,6 +53,7 @@ import { prepareDynamicExtensions } from "../extensions/prepare";
 import { Context as ExtContext, Payload as ExtPayload } from "../extensions/args";
 import { DeployOptions } from "..";
 import * as prompt from "../../prompt";
+import { Timer } from "./release/timer";
 
 export const EVENTARC_SOURCE_ENV = "EVENTARC_CLOUD_EVENT_SOURCE";
 
@@ -64,6 +65,9 @@ export async function prepare(
   options: DeployOptions,
   payload: args.Payload,
 ): Promise<void> {
+  const prepareTimer = new Timer();
+  logger.info("[timing] functions: prepare: starting preparation");
+
   const projectId = needProjectId(options);
   const projectNumber = await needProjectNumber(options);
 
@@ -79,12 +83,14 @@ export async function prepare(
   }
 
   // ===Phase 0. Check that minimum APIs required for function deploys are enabled.
+  const apiTimer = new Timer();
   const checkAPIsEnabled = await Promise.all([
     ensureApiEnabled.ensure(projectId, functionsOrigin(), "functions"),
     ensureApiEnabled.check(projectId, runtimeconfigOrigin(), "runtimeconfig", /* silent=*/ true),
     ensure.cloudBuildEnabled(projectId),
     ensureApiEnabled.ensure(projectId, artifactRegistryDomain(), "artifactregistry"),
   ]);
+  logger.info(`[timing] functions: prepare: ensured minimum APIs enabled (${apiTimer.stop()}ms)`);
 
   // Get the Firebase Config, and set it on each function in the deployment.
   const firebaseConfig = await functionsConfig.getFirebaseConfig(options);
@@ -106,6 +112,7 @@ export async function prepare(
   // This drives GA4 metric `has_runtime_config` in the functions deploy reporter.
   context.hasRuntimeConfig = Object.keys(runtimeConfig).some((k) => k !== "firebase");
 
+  const loadCodebasesTimer = new Timer();
   const wantBuilds = await loadCodebases(
     context.config,
     options,
@@ -113,6 +120,7 @@ export async function prepare(
     runtimeConfig,
     context.filters,
   );
+  logger.info(`[timing] functions: prepare: loaded codebases (${loadCodebasesTimer.stop()}ms)`);
 
   // == Phase 1.5 Prepare extensions found in codebases if any
   if (Object.values(wantBuilds).some((b) => b.extensions)) {
@@ -124,6 +132,7 @@ export async function prepare(
   }
 
   // == Phase 2. Resolve build to backend.
+  const resolveBackendsTimer = new Timer();
   const codebaseUsesEnvs: string[] = [];
   const wantBackends: Record<string, backend.Backend> = {};
   for (const [codebase, wantBuild] of Object.entries(wantBuilds)) {
@@ -207,8 +216,10 @@ export async function prepare(
 
   // ===Phase 2.5. Before proceeding further, let's make sure that we don't have conflicting function names.
   validate.endpointsAreUnique(wantBackends);
+  logger.info(`[timing] functions: prepare: resolved backends (${resolveBackendsTimer.stop()}ms)`);
 
   // ===Phase 3. Prepare source for upload.
+  const prepareSourceTimer = new Timer();
   context.sources = {};
   for (const [codebase, wantBackend] of Object.entries(wantBackends)) {
     const cfg = configForCodebase(context.config, codebase);
@@ -256,13 +267,20 @@ export async function prepare(
     }
     context.sources[codebase] = source;
   }
+  logger.info(`[timing] functions: prepare: prepared source for upload (${prepareSourceTimer.stop()}ms)`);
 
   // ===Phase 4. Fill in details and validate endpoints. We run the check for ALL endpoints - we think it's useful for
   // validations to fail even for endpoints that aren't being deployed so any errors are caught early.
+  const fillDetailsTimer = new Timer();
   payload.functions = {};
+
+  const existingBackendTimer = new Timer();
+  const existingBackendResult = await backend.existingBackend(context);
+  logger.info(`[timing] functions: prepare: fetched existing backend (${existingBackendTimer.stop()}ms)`);
+
   const haveBackends = groupEndpointsByCodebase(
     wantBackends,
-    backend.allEndpoints(await backend.existingBackend(context)),
+    backend.allEndpoints(existingBackendResult),
   );
   for (const [codebase, wantBackend] of Object.entries(wantBackends)) {
     const haveBackend = haveBackends[codebase] || backend.empty();
@@ -275,13 +293,18 @@ export async function prepare(
     validate.endpointsAreValid(wantBackend);
     inferBlockingDetails(wantBackend);
   }
+  logger.info(
+    `[timing] functions: prepare: filled in details and validated endpoints (${fillDetailsTimer.stop()}ms)`,
+  );
 
   // ===Phase 5. Enable APIs required by the deploying backends.
+  const enableApisTimer = new Timer();
   const wantBackend = backend.merge(...Object.values(wantBackends));
   const haveBackend = backend.merge(...Object.values(haveBackends));
 
   await ensureAllRequiredAPIsEnabled(projectNumber, wantBackend);
   await warnIfNewGenkitFunctionIsMissingSecrets(wantBackend, haveBackend, options);
+  logger.info(`[timing] functions: prepare: enabled required APIs (${enableApisTimer.stop()}ms)`);
 
   // ===Phase 6. Ask for user prompts for things might warrant user attentions.
   // We limit the scope endpoints being deployed.
@@ -293,6 +316,7 @@ export async function prepare(
 
   // ===Phase 7. Finalize preparation by "fixing" all extraneous environment issues like IAM policies.
   // We limit the scope endpoints being deployed.
+  const finalizeTimer = new Timer();
   await backend.checkAvailability(context, matchingBackend);
   await validate.secretsAreValid(projectId, matchingBackend);
   await ensureServiceAgentRoles(
@@ -310,6 +334,7 @@ export async function prepare(
     options.dryRun,
   );
   await ensure.secretAccess(projectId, matchingBackend, haveBackend, options.dryRun);
+  logger.info(`[timing] functions: prepare: finalized IAM and secrets (${finalizeTimer.stop()}ms)`);
   /**
    * ===Phase 8 Generates the hashes for each of the functions now that secret versions have been resolved.
    * This must be called after `await validate.secretsAreValid`.
@@ -317,6 +342,8 @@ export async function prepare(
   updateEndpointTargetedStatus(wantBackends, context.filters || []);
   validate.checkFiltersIntegrity(wantBackends, context.filters);
   applyBackendHashToBackends(wantBackends, context);
+
+  logger.info(`[timing] functions: prepare: total preparation time (${prepareTimer.stop()}ms)`);
 }
 
 /**
